@@ -1,177 +1,268 @@
 import os
+import asyncio
 import requests
-from fastapi import FastAPI, HTTPException, Form
-from langchain_cohere import ChatCohere
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_community.document_loaders.csv_loader import CSVLoader
-import uvicorn
-import vt
+import logging
 import base64
+from telegram import Update, Bot
+from telegram.ext import Application, filters, CommandHandler, MessageHandler, ContextTypes
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_groq import ChatGroq
+from uuid import uuid4
 
+# Enable logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Global variables
-model = None
-known_scams = []
-api_key = "648641a00ef899a54caafd35a54df3885fd8068977baeb8614ca9ac590bac36d"
-if not api_key:
-    raise ValueError("VIRUSTOTAL_API_KEY environment variable not set")
-client = vt.Client(api_key)
-# Initialize FastAPI
-app = FastAPI()
+# Configuration
+API_KEY = os.getenv("GROK_API_KEY", "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")
+VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "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")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7701419281:AAF5xDnnpUs6ZvRw8cu_IMc6S93LoyIItgI")
 
-def lifespan(app: FastAPI):
-    global model, known_scams
+# Validate environment variables
+if not all([API_KEY, VIRUSTOTAL_API_KEY, TELEGRAM_BOT_TOKEN]):
+    raise ValueError("Missing required environment variables")
 
-    # Load Cohere API key
-    api_key = os.getenv("COHERE_API_KEY")
-    if not api_key:
-        raise ValueError("COHERE_API_KEY environment variable not set")
-    model = ChatCohere(model="command-r-plus", api_key=api_key)
+# Initialize Groq model
+model = ChatGroq(model="llama-3.3-70b-versatile", api_key=API_KEY)
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-    # Load known scams database from CSV
+# In-memory storage
+user_memory = {}  # Store user conversation history
+community_flags = {}  # Store community-flagged tokens
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a welcome message when the /start command is issued."""
+    user = update.effective_user
+    user_memory[user.id] = []
+    await update.message.reply_text(
+        f"Hi {user.first_name}! I'm AgentCypher 🤖, built for RugCheck's hackathon. "
+        "I help verify tokens, scan URLs, and detect scams using RugCheck and VirusTotal APIs. "
+        "Use /help for commands or chat directly. Join our community: https://t.me/+wOob4U1U2tplNmFk"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display available commands."""
+    await update.message.reply_text(
+        "Commands:\n"
+        "/check_scam <text/wallet> - Check if text is a scam.\n"
+        "/verify_token <token address> - Verify token details.\n"
+        "/scan_url <example.com> - Scan a URL for risks.\n"
+        "/flag_token <token address> <reason> - Flag a suspicious token.\n"
+        "/token_report <token address> - Generate a shareable token report.\n"
+        "Chat directly for general queries!\n"
+        "Community: https://t.me/+wOob4U1U2tplNmFk"
+    )
+
+async def check_scam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check if input text is a potential scam."""
+    if not context.args:
+        await update.message.reply_text("Usage: /check_scam <text>")
+        return
+
+    text = " ".join(context.args)
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
     try:
-        file = "urls.csv"
-        loader = CSVLoader(file_path=file)
-        data = loader.load()
-        known_scams = [entry.page_content.lower() for entry in data]
-        print(f"Loaded {len(known_scams)} known scams from database.")
-    except Exception as e:
-        print(f"Error loading CSV database: {e}")
-        known_scams = []
-
-    yield  # Server runs here
-
-    # Cleanup (if needed)
-    print("Shutting down application...")
-
-app = FastAPI(lifespan=lifespan)
-
-# RugCheck API: Verify token
-def check_verified_tokens():
-    try:
-        url = "https://api.rugcheck.xyz/v1/stats/verified"
-        response = requests.get(url, headers={"Accept": "application/json"})
-        if response.status_code == 200:
-            return response.json()  # List of verified tokens
-        else:
-            return None
-    except Exception as e:
-        print(f"Error checking RugCheck API: {str(e)}")
-        return None
-
-# VirusTotal API: Scan URL
-def scan_url_with_virustotal(scan_url: str):
-    try:
-        virustotal_api_key = os.getenv("VIRUSTOTAL_API_KEY")
-        if not virustotal_api_key:
-            raise ValueError("VIRUSTOTAL_API_KEY environment variable not set")
-
-        # VirusTotal API endpoint
-        url = "https://www.virustotal.com/api/v3/urls"
-        headers = {"x-apikey": virustotal_api_key}
-        data = {"url": scan_url}
-
-        # Send POST request to scan URL
-        response = requests.post(url, headers=headers, data=data)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return {"error": f"Failed to scan URL. Status code: {response.status_code}"}
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/")
-async def root():
-    return {
-        "message": "Hello! I am AgentCypher 🤖, your scam and token verification assistant. Use the endpoints to check scams, verify tokens, or scan URLs.",
-        "endpoints": {
-            "check_scam": "/api/v1/check_scam/",
-            "check_verified_tokens": "/api/v1/verified_tokens/",
-            "scan_url": "/api/v1/scan_url/"
-        }
-    }
-
-# API to check if input text is a scam
-@app.post("/api/v1/check_scam/")
-async def check_scam(text: str = Form(...)):
-    global model, known_scams
-    try:
-        clean_text = text.lower().strip()
-        if any(clean_text in scam for scam in known_scams):
-            return {
-                "response": "⚠️ This looks like a **known scam** from our database. Stay cautious! 🚨",
-                "is_scam": True
-            }
-
-        # Use AI model for analysis
         system_message = SystemMessage(
-            content="You are a scam detector. Respond with 'Scam:' or 'Not a Scam:' and a brief explanation."
+            content="You are a scam detector leveraging RugCheck and X data. Respond with 'Scam:' or 'Not a Scam:' and a brief explanation."
         )
-        human_message = HumanMessage(content=f"Analyze this: {text}")
-        response = model(messages=[system_message, human_message])
-
-        # Parse AI response
-        is_scam = response.content.lower().startswith("scam:")
-        return {
-            "response": f"🕵️ Analysis result:\n{response.content}",
-            "is_scam": is_scam
-        }
+        human_message = HumanMessage(content=f"Analyze: {text}")
+        response = model.invoke([system_message, human_message])
+        await update.message.reply_text(f"🕵️ Analysis:\n{response.content}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Oops! Something went wrong while analyzing the text: {str(e)}")
+        logger.error(f"Error checking scam: {e}")
+        await update.message.reply_text("Error processing request.")
 
-# API to get recently verified tokens (RugCheck)
-@app.get("/api/v1/verified_tokens/")
-async def verified_tokens():
+async def verify_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Verify a token using RugCheck API."""
+    if not context.args:
+        await update.message.reply_text("Usage: /verify_token <token address>")
+        return
+
+    token_address = context.args[0]
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
     try:
-        tokens = check_verified_tokens()
-        if tokens:
-            return {
-                "response": f"✅ Verified Tokens:\n{tokens}",
-            }
+        response = requests.get(
+            f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report",
+            headers={"Accept": "application/json"}
+        )
+        
+        if response.status_code == 200:
+            token_data = response.json()
+            reply = (
+                f"✅ **Token Verification**\n\n"
+                f"🔹 Name: {token_data.get('tokenMeta', {}).get('name', 'N/A')}\n"
+                f"🔹 Symbol: {token_data.get('tokenMeta', {}).get('symbol', 'N/A')}\n"
+                f"🔹 Risk Score: {token_data.get('score', 'N/A')}\n"
+                f"🔹 Market Cap: {token_data.get('token', {}).get('market_cap', 'N/A')}\n"
+                f"🔹 Liquidity: ${token_data.get('totalMarketLiquidity', 0):,.2f}\n"
+                f"🔹 LP Providers: {token_data.get('totalLPProviders', 'N/A')}\n"
+            )
+            
+            risks = token_data.get('risks', [])
+            reply += "\n⚠️ **Risks**:\n" + (
+                "".join(f"  - {risk.get('name')}: {risk.get('description')} (Score: {risk.get('score')})\n" for risk in risks)
+                if risks else "  No significant risks.\n"
+            )
+            
+            top_holders = token_data.get('topHolders', [])
+            if top_holders:
+                reply += f"\n🔹 Top Holder:\n  - Address: {top_holders[0].get('address', 'N/A')}\n  - {top_holders[0].get('pct', 'N/A')}%"
+            
+            await update.message.reply_text(reply)
+            
+            # Simplified explanation
+            system_message = SystemMessage(
+                content="Explain token verification results in simple terms to advise on investment safety."
+            )
+            response = model.invoke([system_message, HumanMessage(content=reply)])
+            await update.message.reply_text(f"🤖 Explanation:\n{response.content}")
         else:
-            return {"response": "❌ Could not fetch verified tokens at this time. Please try again later."}
+            await update.message.reply_text("❌ Invalid token address.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error verifying token: {e}")
+        await update.message.reply_text("❌ Error verifying token.")
 
-@app.post("/api/v1/scan_url/")
-async def scan_url(url: str = Form(...)):
+async def scan_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scan a URL using VirusTotal API."""
+    if not context.args:
+        await update.message.reply_text("Usage: /scan_url <url>")
+        return
+
+    url = " ".join(context.args)
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
     try:
-        # Encode the URL for VirusTotal's database lookup
         url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
-
-        # Use an async VirusTotal client
-        async with vt.Client(api_key) as client:
-            try:
-                # Check if the URL already exists in VirusTotal
-                url_data = await client.get_object_async(f"/urls/{url_id}")
-
-                # Extract analysis data
-                times_submitted = url_data.times_submitted
-                last_analysis_stats = url_data.last_analysis_stats
-
-                return {
-                    "response": f"🔍 URL found in database!\n"
-                                f"Times submitted: {times_submitted}\n"
-                                f"Last analysis stats:\n"
-                                f"  Harmless: {last_analysis_stats['harmless']}\n"
-                                f"  Malicious: {last_analysis_stats['malicious']}\n"
-                                f"  Suspicious: {last_analysis_stats['suspicious']}\n"
-                                f"  Undetected: {last_analysis_stats['undetected']}\n"
-                                f"  Timeout: {last_analysis_stats['timeout']}\n"
-                }
-
-            except vt.error.APIError as e:
-                if e.code == "NotFoundError":
-                    # Submit the URL for scanning
-                    submission = await client.scan_url_async(url)
-                    return {
-                        "response": "⚠️ URL not found in VirusTotal database. It has been submitted for scanning. Check back later for results."
-                    }
-                else:
-                    raise HTTPException(status_code=500, detail=f"API error occurred: {e.message}")
-
+        response = requests.get(
+            f"https://www.virustotal.com/api/v3/urls/{url_id}",
+            headers={"x-apikey": VIRUSTOTAL_API_KEY}
+        ).json()
+        
+        if "error" not in response:
+            stats = response.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+            reply = (
+                f"🔍 URL Analysis\n\n"
+                f"  Harmless: {stats.get('harmless', 0)}\n"
+                f"  Malicious: {stats.get('malicious', 0)}\n"
+                f"  Suspicious: {stats.get('suspicious', 0)}\n"
+                f"  Risk Score: {round((stats.get('malicious', 0) + stats.get('suspicious', 0)) / max(sum(stats.values()), 1) * 100, 2)}%\n"
+            )
+            await update.message.reply_text(reply)
+            
+            system_message = SystemMessage(
+                content="Explain URL scan results in simple terms to advise on safety."
+            )
+            response = model.invoke([system_message, HumanMessage(content=reply)])
+            await update.message.reply_text(f"🤖 Explanation:\n{response.content}")
+        else:
+            await update.message.reply_text("URL not found. Submitted for scanning.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Something went wrong while scanning the URL: {str(e)}")
- 
+        logger.error(f"Error scanning URL: {e}")
+        await update.message.reply_text("Error scanning URL.")
+
+async def flag_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Allow users to flag suspicious tokens for community review."""
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /flag_token <token address> <reason>")
+        return
+
+    token_address = context.args[0]
+    reason = " ".join(context.args[1:])
+    user = update.effective_user
+    
+    community_flags.setdefault(token_address, []).append({
+        "user_id": user.id,
+        "username": user.username or user.first_name,
+        "reason": reason,
+        "timestamp": update.message.date.isoformat()
+    })
+    
+    await update.message.reply_text(
+        f"🚩 Token {token_address} flagged for: {reason}\n"
+        f"Community flags: {len(community_flags[token_address])}\n"
+        "Thank you for contributing to community safety!"
+    )
+
+async def token_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate a shareable token report."""
+    if not context.args:
+        await update.message.reply_text("Usage: /token_report <token address>")
+        return
+
+    token_address = context.args[0]
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    try:
+        response = requests.get(
+            f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report",
+            headers={"Accept": "application/json"}
+        )
+        
+        if response.status_code == 200:
+            token_data = response.json()
+            report = (
+                f"📊 **RugCheck Token Report**\n\n"
+                f"🔹 Token: {token_data.get('tokenMeta', {}).get('name', 'N/A')} ({token_data.get('tokenMeta', {}).get('symbol', 'N/A')})\n"
+                f"🔹 Address: {token_address}\n"
+                f"🔹 Risk Score: {token_data.get('score', 'N/A')}\n"
+                f"🔹 Community Flags: {len(community_flags.get(token_address, []))}\n"
+                f"🔹 Share: Post this report on X and tag @Rugcheckxyz for visibility!\n"
+            )
+            await update.message.reply_text(report)
+        else:
+            await update.message.reply_text("❌ Invalid token address.")
+    except Exception as e:
+        logger.error(f"Error generating report: {e}")
+        await update.message.reply_text("❌ Error generating report.")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle general user messages."""
+    user = update.effective_user
+    user_message = update.message.text
+    
+    if user_message.lower().startswith("scan url"):
+        await scan_url(update, context)
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    conversation = user_memory.get(user.id, [])
+    
+    try:
+        messages = [
+            SystemMessage(
+                content="You are AgentCypher, a RugCheck hackathon bot specializing in crypto scam detection, token verification, and URL scanning. Be concise and helpful."
+            )
+        ]
+        messages.extend([HumanMessage(content=msg) for msg in conversation[-4:]])
+        messages.append(HumanMessage(content=user_message))
+        
+        response = model.invoke(messages)
+        conversation.extend([user_message, response.content])
+        user_memory[user.id] = conversation[-10:]
+        
+        await update.message.reply_text(response.content)
+    except Exception as e:
+        logger.error(f"Error handling message: {e}")
+        await update.message.reply_text("Error processing message. Try /check_scam or /scan_url.")
+
+def main() -> None:
+    """Run the bot."""
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("check_scam", check_scam))
+    application.add_handler(CommandHandler("verify_token", verify_token))
+    application.add_handler(CommandHandler("scan_url", scan_url))
+    application.add_handler(CommandHandler("flag_token", flag_token))
+    application.add_handler(CommandHandler("token_report", token_report))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    application.run_polling()
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    asyncio.run(main())
